@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import time
 from typing import Optional, Any, Tuple
 import functools
 import jax
@@ -273,25 +274,32 @@ class Trainer:
                 f"Started epoch {epoch + 1} of {self.trainer_config.num_epochs}..."
             )
 
+            time_epoch = 0
             for step, batch in enumerate(self.train_dataloader):
-                if step >= max_steps:
-                    break
-
                 if (
-                    step == 1
-                    or (step + 1) % self.trainer_config.log_interval == 0
+                    step != 0
+                    and (
+                        step == 1
+                        or prev_step % self.trainer_config.log_interval == 0
+                    )
                 ):
                     # Printing metrics of previous step to avoid disrupting XLA pipelining
                     print(
                         f"Step {prev_step} | "
                         f"Train Loss: {prev_loss:.4f} | "
-                        f"Val Loss: {prev_val_loss:.4f} | "
+                        f"Val Loss: {f'{prev_val_loss:.4f}' if prev_val_loss is not None else 'no evaluation at this step'} |"
                         # f"Next Token Prediction Accuracy (train, val): {prev_accuracy:.2%}, {prev_val_accuracy:.2%}"
                     )
 
+                if step >= max_steps:
+                    break
+
                 pass
 
+                val_loss, val_accuracy = None, None
+
                 batch = _preprocess_batch(batch)
+                batch_size, seq_len = batch["input_ids"].shape
                 batch = host_local_array_to_global_array(
                     batch, self.mesh, PS("batch")
                 )
@@ -299,6 +307,7 @@ class Trainer:
                     optimizer_state, NamedSharding(self.mesh, PS())
                 )
 
+                start_time = time.time()
                 (
                     loss,
                     (accuracy, model_params, optimizer_state),
@@ -309,6 +318,12 @@ class Trainer:
                     optimizer_state=optimizer_state,
                     batch=batch,
                 )
+                loss.block_until_ready()
+                end_time = time.time()
+                time_step = end_time - start_time
+                time_epoch += time_step
+                mfu = self.calculate_mfu(time_step, batch_size=batch_size, seq_len=seq_len)
+                print(f'step: {step}, time_step: {time_step}, MFU: {100.*mfu:.3f}%')
 
                 if self.trainer_config.eval_interval > 0 and (
                     (step + 1) % self.trainer_config.eval_interval == 0
@@ -433,6 +448,20 @@ class Trainer:
         )
         print("Hugging Face model saved at:", export_dir)
 
+    def get_num_params(self):
+        model_params, _ = eqx.partition(self.model, eqx.is_array)
+        total_params = sum(param.size for param in jax.tree_util.tree_leaves(model_params))
+
+        return total_params
+
+# TPU v5p Peak compute per chip (bf16): 459 TFLOPs
+    def calculate_mfu(self, time_step, batch_size, seq_len, steps: int = 1, chip_peak_compute: int = 459e12 ):
+        time_taken_per_step = time_step / steps
+        num_params = self.get_num_params()
+
+        if self.trainer_config.use_lora:
+            return 4 * batch_size * seq_len * num_params / time_taken_per_step / chip_peak_compute
+        return 6 * batch_size * seq_len * num_params / time_taken_per_step / chip_peak_compute
 
 def _merge_lora_params(model):
     def merge_fn(module):
