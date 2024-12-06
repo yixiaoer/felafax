@@ -454,8 +454,8 @@ class Trainer:
 
         return total_params
 
-# TPU v5p Peak compute per chip (bf16): 459 TFLOPs
-    def calculate_mfu(self, time_step, batch_size, seq_len, steps: int = 1, chip_peak_compute: int = 459e12 ):
+    # TPU v5p Peak compute per chip (bf16): 459 TFLOPs
+    def calculate_mfu(self, time_step, batch_size, seq_len, steps: int = 1, chip_peak_compute: int = 459e12):
         time_taken_per_step = time_step / steps
         num_params = self.get_num_params()
 
