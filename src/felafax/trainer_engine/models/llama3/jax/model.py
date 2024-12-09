@@ -6,7 +6,10 @@ import equinox as eqx
 from typing import Optional, Any, List
 import ml_dtypes
 import jax.nn.initializers as init
+from jax.experimental.pallas.ops.tpu.flash_attention import BlockSizes, flash_attention
 
+blocksize_q=128
+blocksize_k=128
 
 DTYPE_MAP = {
     "float32": jnp.float32,
@@ -280,6 +283,8 @@ class LlamaSdpaAttention(eqx.Module):
     rope_theta: float
     param_dtype: Any
     compute_dtype: Any
+    sm_scale: float
+    block_size: BlockSizes
 
     def __init__(
         self,
@@ -350,6 +355,21 @@ class LlamaSdpaAttention(eqx.Module):
             compute_dtype=self.compute_dtype,
         )
 
+        self.sm_scale = (1.0 / jnp.sqrt(self.head_dim)).astype(self.compute_dtype)
+        self.block_size = BlockSizes(
+            block_q=blocksize_q,
+            block_k_major=blocksize_k,
+            block_k=blocksize_k,
+            block_b=1,
+            block_q_major_dkv=blocksize_q,
+            block_k_major_dkv=blocksize_k,
+            block_k_dkv=blocksize_k,
+            block_q_dkv=blocksize_q,
+            block_k_major_dq=blocksize_k,
+            block_k_dq=blocksize_k,
+            block_q_dq=blocksize_q,
+        )
+
     def __call__(self, x, position_ids, attention_mask=None):
         x = x.astype(self.compute_dtype)
 
@@ -397,30 +417,16 @@ class LlamaSdpaAttention(eqx.Module):
                 value_states, self.num_heads // self.num_key_value_heads, axis=1
             )
 
-        attn_weights = jnp.einsum(
-            "bhqd,bhkd->bhqk", query_states, key_states
-        ) / jnp.sqrt(self.head_dim)
+        attn_output = flash_attention(
+            q=query_states,
+            k=key_states,
+            v=value_states,
+            ab=attention_mask,
+            block_sizes=self.block_size,
+            causal=True,
+            sm_scale=self.sm_scale,
+        )
 
-        # Create causal mask
-        q_len, k_len = query_states.shape[2], key_states.shape[2]
-        causal_mask = jnp.tril(jnp.ones((q_len, q_len)))
-        causal_mask = causal_mask[None, None, :, :]
-
-        # If attention_mask is provided, use it to override the causal mask
-        if attention_mask is not None:
-            # Broadcast attention_mask to the correct shape
-            attention_mask = jnp.expand_dims(attention_mask, axis=(1, 2))
-            # Combine causal_mask and attention_mask
-            combined_mask = jnp.minimum(causal_mask, attention_mask)
-        else:
-            combined_mask = causal_mask
-
-        # Apply the combined mask
-        attn_weights = jnp.where(combined_mask == 0, float("-inf"), attn_weights)
-
-        attn_weights = jax.nn.softmax(attn_weights, axis=-1)
-
-        attn_output = jnp.einsum("bhqk,bhkd->bhqd", attn_weights, value_states)
         attn_output = attn_output.transpose(0, 2, 1, 3).reshape(
             bsz, q_len, self.num_heads * self.head_dim
         )
