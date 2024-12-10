@@ -355,7 +355,7 @@ class LlamaSdpaAttention(eqx.Module):
             compute_dtype=self.compute_dtype,
         )
 
-        self.sm_scale = (1.0 / jnp.sqrt(self.head_dim)).astype(self.compute_dtype)
+        self.sm_scale = float(1.0 / jnp.sqrt(self.head_dim))
         self.block_size = BlockSizes(
             block_q=blocksize_q,
             block_k_major=blocksize_k,
