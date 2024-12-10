@@ -417,15 +417,40 @@ class LlamaSdpaAttention(eqx.Module):
                 value_states, self.num_heads // self.num_key_value_heads, axis=1
             )
 
-        attn_output = flash_attention(
-            q=query_states,
-            k=key_states,
-            v=value_states,
-            ab=attention_mask,
-            block_sizes=self.block_size,
-            causal=True,
-            sm_scale=self.sm_scale,
-        )
+        attn_weights = jnp.einsum(
+            "bhqd,bhkd->bhqk", query_states, key_states
+        ) / jnp.sqrt(self.head_dim)
+
+        # Create causal mask
+        q_len, k_len = query_states.shape[2], key_states.shape[2]
+        causal_mask = jnp.tril(jnp.ones((q_len, q_len)))
+        causal_mask = causal_mask[None, None, :, :]
+
+        # If attention_mask is provided, use it to override the causal mask
+        if attention_mask is not None:
+            # Broadcast attention_mask to the correct shape
+            attention_mask = jnp.expand_dims(attention_mask, axis=(1, 2))
+            # Combine causal_mask and attention_mask
+            combined_mask = jnp.minimum(causal_mask, attention_mask)
+        else:
+            combined_mask = causal_mask
+
+        # Apply the combined mask
+        attn_weights = jnp.where(combined_mask == 0, float("-inf"), attn_weights)
+
+        attn_weights = jax.nn.softmax(attn_weights, axis=-1)
+
+        attn_output = jnp.einsum("bhqk,bhkd->bhqd", attn_weights, value_states)
+
+        # attn_output = flash_attention(
+        #     q=query_states,
+        #     k=key_states,
+        #     v=value_states,
+        #     ab=attention_mask,
+        #     block_sizes=self.block_size,
+        #     causal=True,
+        #     sm_scale=self.sm_scale,
+        # )
 
         attn_output = attn_output.transpose(0, 2, 1, 3).reshape(
             bsz, q_len, self.num_heads * self.head_dim
